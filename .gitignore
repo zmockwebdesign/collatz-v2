@@ -1,0 +1,17 @@
+# Build artifacts
+collatz_crypto
+collatz_hash
+collatz_fast_hash
+benchmark_all
+crf_collision
+hash_filesystem
+
+# Generated output
+collatz_v4b_filesystem_hashes.txt
+sha256_filesystem_hashes.txt
+
+# LaTeX auxiliary
+*.aux
+*.log
+*.out
+*.toc

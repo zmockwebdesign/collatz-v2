@@ -3,7 +3,7 @@
 
 from compare_hashes import analyze_collatz_security
 #
-text = 'Noobas123!@#'
+text = 'sample input 12'
 r = analyze_collatz_security(text)
 
 print(f"Input: '{r['text']}'")

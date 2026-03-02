@@ -152,7 +152,7 @@ if __name__ == "__main__":
         'Hello',
         'password',
         'password1',
-        'Noobas123!@#',
+        'sample input 12',
         'The quick brown fox jumps over the lazy dog',
     ]
     

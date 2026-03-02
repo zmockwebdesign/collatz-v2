@@ -63,7 +63,7 @@ def main():
     print("=" * 80)
     print()
     
-    test_inputs = ['hi', 'password', 'Noobas123!@#', 'MySecretKey123']
+    test_inputs = ['hi', 'password', 'sample input 12', 'MySecretKey123']
     
     print("-" * 80)
     print("COLLATZ OBFUSCATION (pure math, 20 levels, 100T multiplier)")
@@ -85,7 +85,7 @@ def main():
     print("-" * 80)
     print()
     
-    text = 'Noobas123!@#'
+    text = 'sample input 12'
     hash_funcs = [
         ('MD5', hashlib.md5),
         ('SHA-1', hashlib.sha1),

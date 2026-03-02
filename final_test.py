@@ -47,7 +47,7 @@ def collatz_fast(n):
 MULTIPLIER = 100_000_000
 NUM_LEVELS = 15
 
-text = 'Noobas123!@#'
+text = 'sample input 12'
 
 print('=' * 70)
 print('COLLATZ OBFUSCATION - PURE MATH, NO CRYPTO LIBRARIES')

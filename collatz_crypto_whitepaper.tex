@@ -1,0 +1,1048 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage[margin=1in]{geometry}
+
+\newcommand{\toprule}{\hline}
+\newcommand{\midrule}{\hline}
+\newcommand{\bottomrule}{\hline}
+\newcommand{\url}[1]{\texttt{#1}}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{claim}{Claim}
+
+\newcommand{\rotl}{\mathrm{rotl}_{64}}
+\newcommand{\ctz}{\mathrm{ctz}}
+
+\title{%
+    \textbf{Collatz-Based Cryptographic Primitives:}\\[4pt]
+    \large A Permutation, Hash Function, Authenticated Cipher,\\
+    and Message Authentication Code\\
+    Derived from the $3n+1$ Mapping
+}
+
+\author{
+    John Mock\\[4pt]
+    Zachary Mock\\[6pt]
+    \small Draft for Peer Review --- March 2026
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a family of cryptographic primitives whose core nonlinear
+operation is derived from the Collatz mapping
+$n \mapsto (3n+1)/2^{\nu_2(3n+1)}$.
+The central construction is \textbf{CollatzPerm-512}, a 512-bit
+cryptographic permutation that pairs a branchless Collatz step with a
+$64 \times 64 \to 128$-bit integer multiplication for diffusion. On top
+of this single permutation we build three modes of operation using
+well-studied sponge and duplex constructions:
+(1)~\textbf{CollatzHash}---a sponge hash with 256-, 512-, or 1024-bit
+output;
+(2)~\textbf{CollatzAEAD}---a duplex-sponge authenticated cipher
+(256-bit key, 128-bit nonce, 128-bit tag);
+(3)~\textbf{CollatzMAC}---a keyed-sponge message authentication code.
+The design targets 128-bit security. We provide a reference C++17
+implementation with ARM64 inline assembly for the critical path.
+Empirical results on Apple M3 Max show CollatzHash-256 at 17\,M\,ops/s
+(3.4$\times$ faster than standalone SHA-256), CollatzAEAD at 860\,MB/s on
+4\,KB messages, and CollatzMAC at 6.9\,M\,ops/s (5.4$\times$ faster than
+HMAC-SHA-256). All 70 security validation tests pass, including full
+permutation diffusion, avalanche at 49.6--50.3\%, zero collisions in
+$10^6$ inputs, AEAD authentication integrity, and constant-time tag
+comparison.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+
+The Collatz conjecture (also known as the $3n+1$ problem) states that
+for any positive integer $n$, the sequence defined by
+\[
+    T(n) = \begin{cases}
+        n/2 & \text{if } n \equiv 0 \pmod{2},\\
+        (3n+1)/2 & \text{if } n \equiv 1 \pmod{2},
+    \end{cases}
+\]
+eventually reaches 1. Despite its elementary statement, the conjecture
+remains one of the most famous open problems in mathematics. The mapping
+exhibits chaotic, pseudorandom behavior: nearby starting values can
+produce vastly different orbit lengths and trajectories.
+
+We exploit this pseudorandom behavior as a \emph{nonlinear mixing
+primitive} for cryptographic hash functions and ciphers. Prior work has
+explored Collatz-like maps in pseudorandom number generation
+\cite{lagarias1985}, but to our knowledge no complete cryptographic suite
+has been built on the $3n+1$ mapping.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item A novel cryptographic permutation, \textbf{CollatzPerm-512},
+          that uses a branchless Collatz step paired with 128-bit
+          integer multiplication as its nonlinear layer.
+    \item Three modes of operation---hash, AEAD, MAC---built using
+          standard sponge/duplex constructions, inheriting formal
+          security bounds from the permutation.
+    \item A reference implementation in C++17 with hand-tuned ARM64
+          assembly for the critical path.
+    \item Empirical security evaluation: diffusion, avalanche,
+          distribution, collision search, and authentication integrity.
+    \item Performance benchmarks against SHA-256, ChaCha20, and
+          HMAC-SHA-256.
+\end{enumerate}
+
+\subsection{Design Philosophy}
+
+The fastest non-cryptographic hashes (rapidhash \cite{rapidhash},
+wyhash \cite{wyhash}, xxHash3 \cite{xxhash}) share a key insight: a
+single $64 \times 64 \to 128$-bit multiply followed by XOR of the high
+and low halves provides massive diffusion in 3--4 CPU cycles. On the
+other hand, established cryptographic hashes (SHA-256, SHA-3) derive
+their security from carefully designed round functions with proven
+diffusion properties, at the cost of higher latency.
+
+Our design occupies a middle ground: we replace the purely algebraic
+multiply with a \emph{Collatz--multiply hybrid} that adds mathematical
+nonlinearity from number theory at minimal cycle cost, then use the
+multiply for diffusion. The result is faster than SHA-256 while providing
+a cryptographic-strength construction.
+
+\subsection{Notation}
+
+\begin{itemize}
+    \item $\nu_2(n)$: the 2-adic valuation of $n$ (number of trailing
+          zeros in the binary representation).
+    \item $\rotl(x, r)$: 64-bit left rotation by $r$ positions.
+    \item $\ctz(n) = \nu_2(n)$: count trailing zeros.
+    \item $\oplus$: bitwise exclusive-or (XOR).
+    \item $\cdot_{128}$: $64 \times 64$-bit unsigned multiplication
+          producing a 128-bit result, split into low ($\mathrm{lo}$) and
+          high ($\mathrm{hi}$) 64-bit words.
+    \item $s[0..7]$: the 512-bit state as eight 64-bit words.
+    \item $R_a = 12$: number of rounds for initialization and finalization.
+    \item $R_b = 8$: number of rounds for per-block processing.
+\end{itemize}
+
+% =====================================================================
+\section{Prior Work: CollatzHash V4 (Non-Cryptographic)}
+\label{sec:v4}
+% =====================================================================
+
+Before developing the cryptographic suite, we designed
+\textbf{CollatzHash V4}, a high-performance non-cryptographic hash
+optimized for maximum throughput.
+
+\subsection{Core Primitive: \texttt{collatz\_rapid\_mix}}
+
+The V4 mixing function operates on two 64-bit inputs $(a, b)$ and
+produces a 64-bit output. The algorithm proceeds as follows:
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Function}} collatz\_rapid\_mix$(a, b)$:\\
+\> 1. $a \leftarrow a \,|\, 1$ \textrm{\small (ensure odd, branchless)}\\
+\> 2. $t \leftarrow 3a + 1$\\
+\> 3. $t \leftarrow t \gg \ctz(t)$ \textrm{\small (first Collatz iteration)}\\
+\> 4. $t_2 \leftarrow 3t + 1$\\
+\> 5. $t_2 \leftarrow t_2 \gg \ctz(t_2)$ \textrm{\small (second Collatz iteration)}\\
+\> 6. $a \leftarrow t_2$\\
+\> 7. $(\mathrm{lo}, \mathrm{hi}) \leftarrow a \cdot_{128} b$\\
+\> 8. $a \leftarrow a \oplus \mathrm{lo}$;\quad $b \leftarrow b \oplus \mathrm{hi}$\\
+\> 9. \textbf{return} $a \oplus b$
+\end{tabbing}
+\end{quote}
+
+\subsection{Architecture}
+
+V4 uses a 192-bit state (three 64-bit accumulators $s_0, s_1, s_2$)
+with:
+\begin{itemize}
+    \item \textbf{Short-input fast path} ($\leq 48$ bytes): 2--3 mix
+          calls, no loops.
+    \item \textbf{Large-input path}: 3 parallel accumulators processing
+          48-byte blocks.
+    \item \textbf{Sponge squeeze}: for output widths beyond 64 bits (up
+          to 1024 bits), re-permuting the state and emitting 64 bits per
+          squeeze.
+\end{itemize}
+
+\subsection{ARM64 Assembly Optimization}
+
+On Apple M3 Max (ARM64), the V4 mixing function is implemented in 11--16
+instructions using:
+\begin{itemize}
+    \item \texttt{ADD}+\texttt{LSL} for $3n$ (fused add-shift),
+    \item \texttt{RBIT}+\texttt{CLZ} for $\ctz$ (bit-reverse then count
+          leading zeros),
+    \item \texttt{MUL}+\texttt{UMULH} for 128-bit multiply (low and
+          high halves).
+\end{itemize}
+
+A single-iteration variant (V4b) uses 11 instructions and achieves
+16\,M\,ops/s at 1024-bit output and 253\,M\,ops/s at 64-bit output.
+
+\subsection{Limitations}
+
+V4's 192-bit state provides only $2^{64}$ collision resistance
+(capacity $= 128$ bits), making it unsuitable for cryptographic use. It
+has no key schedule, no formal security claims, and no resistance to
+algebraic or differential attacks. This motivated the design of the
+cryptographic suite described in the following sections.
+
+% =====================================================================
+\section{CollatzPerm-512: The Cryptographic Permutation}
+\label{sec:perm}
+% =====================================================================
+
+\subsection{State}
+
+The permutation operates on a 512-bit state represented as eight 64-bit
+words: $s = (s[0], s[1], \ldots, s[7])$.
+
+The state is divided into:
+\begin{itemize}
+    \item \textbf{Rate} ($r = 256$ bits): words $s[0..3]$, used for
+          absorbing input and squeezing output.
+    \item \textbf{Capacity} ($c = 256$ bits): words $s[4..7]$, never
+          directly exposed.
+\end{itemize}
+
+\subsection{Round Function}
+
+Each round $i$ ($0 \leq i < R$) applies three layers in sequence.
+
+\subsubsection{Layer 1: Nonlinear (Collatz--Multiply Pairs)}
+
+Four independent pairs $(s[0],s[1])$, $(s[2],s[3])$, $(s[4],s[5])$,
+$(s[6],s[7])$ are processed by the \texttt{collatz\_mul\_pair} operation:
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Function}} collatz\_mul\_pair$(a, b)$:\\
+\> 1. $a \leftarrow a \oplus \rotl(a, 23)$ \textrm{\small (pre-mix rotation)}\\
+\> 2. $a \leftarrow a \,|\, 1$ \textrm{\small (ensure odd)}\\
+\> 3. $t \leftarrow 3a + 1$\\
+\> 4. $t \leftarrow t \gg \ctz(t)$ \textrm{\small (Collatz step)}\\
+\> 5. $a \leftarrow t$\\
+\> 6. $(\mathrm{lo}, \mathrm{hi}) \leftarrow a \cdot_{128} b$ \textrm{\small (128-bit multiply)}\\
+\> 7. $a \leftarrow a \oplus \mathrm{lo}$;\quad $b \leftarrow b \oplus \mathrm{hi}$ \textrm{\small (XOR feedback)}
+\end{tabbing}
+\end{quote}
+
+The pre-mix rotation (step 1) ensures that bit 0 of the input---which
+would otherwise be destroyed by the $a \,|\, 1$ operation---influences
+the output through bit position 23. This was identified through
+diffusion testing (Section~\ref{sec:diffusion}).
+
+\subsubsection{Layer 2: Linear Diffusion}
+
+Cross-pair mixing ensures information propagates between all four pairs
+within approximately 3 rounds:
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Linear diffusion layer:}}\\
+\> 1. $s[0] \leftarrow s[0] \oplus s[2]$;\quad $s[4] \leftarrow s[4] \oplus s[6]$\\
+\> 2. $s[1] \leftarrow s[1] \oplus s[3]$;\quad $s[5] \leftarrow s[5] \oplus s[7]$\\
+\> 3. $(s[0], s[2], s[4], s[6]) \leftarrow (s[2], s[4], s[6], s[0])$ \textrm{\small (word rotation)}\\
+\> 4. $s[1] \leftarrow s[1] \oplus \rotl(s[5], 19)$\\
+\> 5. $s[3] \leftarrow s[3] \oplus \rotl(s[7], 31)$\\
+\> 6. $s[5] \leftarrow s[5] \oplus \rotl(s[1], 7)$\\
+\> 7. $s[7] \leftarrow s[7] \oplus \rotl(s[3], 53)$
+\end{tabbing}
+\end{quote}
+
+The rotation constants $(19, 31, 7, 53)$ are chosen to be pairwise
+coprime to 64, avoiding aligned mixing patterns.
+
+\subsubsection{Layer 3: Round Constant Injection}
+
+$$s[0] \leftarrow s[0] \oplus \mathrm{RC}[i]$$
+
+The twelve round constants $\mathrm{RC}[0..11]$ are derived from the
+binary expansions of $\pi$, $e$, $\sqrt{2}$, and $\sqrt{3}$
+(nothing-up-my-sleeve numbers). When the round count exceeds 12,
+constants are reused cyclically: $\mathrm{RC}[i \bmod 12]$.
+
+The round constants in hexadecimal are:
+{\small
+\begin{align*}
+\mathrm{RC}[0]  &= \mathtt{0x243f6a8885a308d3} & \mathrm{RC}[1]  &= \mathtt{0xb7e151628aed2a6a} \\
+\mathrm{RC}[2]  &= \mathtt{0x6a09e667f3bcc908} & \mathrm{RC}[3]  &= \mathtt{0xbb67ae8584caa73b} \\
+\mathrm{RC}[4]  &= \mathtt{0x3c6ef372fe94f82b} & \mathrm{RC}[5]  &= \mathtt{0xa54ff53a5f1d36f1} \\
+\mathrm{RC}[6]  &= \mathtt{0x510e527fade682d1} & \mathrm{RC}[7]  &= \mathtt{0x9b05688c2b3e6c1f} \\
+\mathrm{RC}[8]  &= \mathtt{0x1f83d9abfb41bd6b} & \mathrm{RC}[9]  &= \mathtt{0x5be0cd19137e2179} \\
+\mathrm{RC}[10] &= \mathtt{0x428a2f98d728ae22} & \mathrm{RC}[11] &= \mathtt{0x7137449123ef65cd}
+\end{align*}
+}
+
+\subsection{Round Counts}
+
+Following the dual-round approach of Ascon \cite{ascon}:
+\begin{itemize}
+    \item $R_a = 12$ rounds: initialization and finalization (full
+          security margin).
+    \item $R_b = 8$ rounds: per-block absorption (reduced, compensated
+          by wide state).
+\end{itemize}
+
+\subsection{Security Claim}
+
+\begin{claim}
+Assuming CollatzPerm-512 behaves as a pseudorandom permutation on 512
+bits, the sponge and duplex constructions provide:
+\begin{itemize}
+    \item Collision resistance: $2^{c/2} = 2^{128}$.
+    \item Preimage resistance:
+          $\min(2^c, 2^{\mathrm{output\_bits}}) = 2^{256}$ (for 256-bit
+          output).
+    \item AEAD confidentiality and integrity: up to
+          $\min(2^{c/2}, 2^k) = 2^{128}$ queries.
+\end{itemize}
+\end{claim}
+
+These bounds follow directly from the generic sponge security
+proofs \cite{sponge_security} with capacity $c = 256$.
+
+% =====================================================================
+\section{CollatzHash V5: Sponge Hash}
+\label{sec:hash}
+% =====================================================================
+
+\subsection{Construction}
+
+CollatzHash V5 is a sponge hash \cite{keccak_sponge} over CollatzPerm-512
+with rate $r = 256$ bits and capacity $c = 256$ bits.
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Function}} CollatzHash$(M, d)$:
+\textrm{\small Hash message $M$ to $d$ output bits}\\[4pt]
+\textrm{\textit{Initialization:}}\\
+\> 1. $s \leftarrow (0, 0, 0, 0, 0, 0, 0, 0)$ \textrm{\small (512-bit zero state)}\\
+\> 2. $s[7] \leftarrow s[7] \oplus \mathtt{DS\_HASH}$ \textrm{\small (domain separation)}\\
+\> 3. $s[6] \leftarrow s[6] \oplus d$ \textrm{\small (encode output length)}\\[4pt]
+\textrm{\textit{Absorption:}}\\
+\> 4. Pad $M$ with $10^*1$ padding to a multiple of $r = 256$ bits\\
+\> 5. \textbf{for each} $r$-bit block $B_i$ of padded $M$:\\
+\> \> $s[0..3] \leftarrow s[0..3] \oplus B_i$\\
+\> \> $s \leftarrow \mathrm{CollatzPerm}(s, R_b)$\\[4pt]
+\textrm{\textit{Finalization and Squeeze:}}\\
+\> 6. $s \leftarrow \mathrm{CollatzPerm}(s, R_a)$ \textrm{\small (finalization)}\\
+\> 7. $Z \leftarrow \varepsilon$ \textrm{\small (empty output)}\\
+\> 8. \textbf{while} $|Z| < d$:\\
+\> \> $Z \leftarrow Z \,\|\, s[0..3]$ \textrm{\small (squeeze $r$ bits)}\\
+\> \> \textbf{if} $|Z| < d$ \textbf{then}
+$s \leftarrow \mathrm{CollatzPerm}(s, R_b)$\\
+\> 9. \textbf{return} first $d$ bits of $Z$
+\end{tabbing}
+\end{quote}
+
+\subsection{Output Widths}
+
+\begin{itemize}
+    \item \textbf{256-bit}: 1 squeeze (no additional permutation after
+          finalization).
+    \item \textbf{512-bit}: 2 squeezes (1 additional permutation).
+    \item \textbf{1024-bit}: 4 squeezes (3 additional permutations).
+\end{itemize}
+
+Each additional 256-bit block is a genuine squeeze from a re-permuted
+state, following the same principle as SHA-3/SHAKE \cite{sha3}.
+
+% =====================================================================
+\section{CollatzAEAD: Authenticated Encryption}
+\label{sec:aead}
+% =====================================================================
+
+CollatzAEAD is a duplex-sponge AEAD cipher \cite{duplex} with:
+\begin{itemize}
+    \item Key: 256 bits.
+    \item Nonce: 128 bits.
+    \item Tag: 128 bits.
+    \item Rate: 256 bits per block.
+\end{itemize}
+
+\subsection{Construction}
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Function}} CollatzAEAD.Encrypt$(K, N, A, P)$:\\[4pt]
+\textrm{\textit{Initialization:}}\\
+\> 1. $s \leftarrow (0, \ldots, 0)$\\
+\> 2. Load $N$ into $s[0..1]$; load $K$ into $s[4..7]$\\
+\> 3. $s[7] \leftarrow s[7] \oplus \mathtt{DS\_AEAD}$\\
+\> 4. $s \leftarrow \mathrm{CollatzPerm}(s, R_a)$\\
+\> 5. $s[4..7] \leftarrow s[4..7] \oplus K$ \textrm{\small (post-init key injection)}\\[4pt]
+\textrm{\textit{Process Associated Data $A$:}}\\
+\> 6. \textbf{for each} padded $r$-bit block $A_i$ of $A$:\\
+\> \> $s[0..3] \leftarrow s[0..3] \oplus A_i$\\
+\> \> $s \leftarrow \mathrm{CollatzPerm}(s, R_b)$\\
+\> 7. $s[7] \leftarrow s[7] \oplus \mathtt{DS\_AD\_END}$ \textrm{\small (domain separation)}\\[4pt]
+\textrm{\textit{Encrypt Plaintext $P$:}}\\
+\> 8. \textbf{for each} $r$-bit block $P_i$:\\
+\> \> $C_i \leftarrow s[0..3] \oplus P_i$ \textrm{\small (keystream XOR)}\\
+\> \> $s[0..3] \leftarrow C_i$ \textrm{\small (absorb ciphertext---duplex feedback)}\\
+\> \> $s \leftarrow \mathrm{CollatzPerm}(s, R_b)$\\[4pt]
+\textrm{\textit{Finalization:}}\\
+\> 9. $s[4..7] \leftarrow s[4..7] \oplus K$\\
+\> 10. $s \leftarrow \mathrm{CollatzPerm}(s, R_a)$\\
+\> 11. $s[4..7] \leftarrow s[4..7] \oplus K$\\
+\> 12. $T \leftarrow s[4..5]$ \textrm{\small (128-bit tag from capacity)}\\
+\> 13. \textbf{return} $(C, T)$
+\end{tabbing}
+\end{quote}
+
+Decryption follows the same structure with the inverse operation on the
+plaintext blocks. The tag is verified using constant-time byte comparison
+before releasing any plaintext.
+
+\subsection{Security Properties}
+
+\begin{itemize}
+    \item \textbf{Confidentiality}: ciphertext is indistinguishable from
+          random under CPA, bounded by $2^{128}$ queries.
+    \item \textbf{Integrity}: forging a valid $(C, T)$ pair requires
+          $2^{128}$ work (tag is extracted from the capacity).
+    \item \textbf{Nonce misuse}: as with all nonce-based AEAD, reusing
+          a nonce with the same key leaks information. This is a standard
+          limitation shared by AES-GCM and ChaCha20-Poly1305.
+\end{itemize}
+
+% =====================================================================
+\section{CollatzMAC: Message Authentication Code}
+\label{sec:mac}
+% =====================================================================
+
+CollatzMAC is a keyed-sponge MAC \cite{sponge_security} with a 256-bit
+key and configurable tag length (128 or 256 bits).
+
+\begin{quote}\tt
+\begin{tabbing}
+\hspace{2em}\=\hspace{2em}\=\kill
+\textrm{\textbf{Function}} CollatzMAC$(K, M, d)$:
+\textrm{\small MAC with $d$-bit tag}\\[4pt]
+\> 1. $s \leftarrow (0, \ldots, 0)$\\
+\> 2. $s[7] \leftarrow s[7] \oplus \mathtt{DS\_MAC}$;\quad
+$s[6] \leftarrow s[6] \oplus d$\\
+\> 3. $s[0..3] \leftarrow s[0..3] \oplus K$ \textrm{\small (absorb key into rate)}\\
+\> 4. $s \leftarrow \mathrm{CollatzPerm}(s, R_a)$\\
+\> 5. \textbf{for each} padded $r$-bit block $M_i$ of $M$:\\
+\> \> $s[0..3] \leftarrow s[0..3] \oplus M_i$\\
+\> \> $s \leftarrow \mathrm{CollatzPerm}(s, R_b)$\\
+\> 6. $s[4..7] \leftarrow s[4..7] \oplus K$ \textrm{\small (key injection before final)}\\
+\> 7. $s \leftarrow \mathrm{CollatzPerm}(s, R_a)$\\
+\> 8. Squeeze $d$ bits from rate\\
+\> 9. \textbf{return} tag
+\end{tabbing}
+\end{quote}
+
+Security is bounded by $\min(2^{c/2}, 2^k) = 2^{128}$ MAC queries,
+following the keyed-sponge PRF bound \cite{sponge_security}.
+
+% =====================================================================
+\section{Domain Separation}
+\label{sec:domain}
+% =====================================================================
+
+Each mode uses a distinct domain separation constant XORed into the
+capacity before processing:
+
+\begin{center}
+\begin{tabular}{|l|l|}
+\toprule
+\textbf{Mode} & \textbf{Constant} \\
+\midrule
+Hash    & $\mathtt{0x01}$ \\
+AEAD    & $\mathtt{0x02}$ \\
+MAC     & $\mathtt{0x04}$ \\
+AAD end & $\mathtt{0x80}$ \\
+Final   & $\mathtt{0xFF}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This ensures that hash digests, ciphertext/tags, and MAC tags computed
+from the same input are cryptographically independent.
+
+% =====================================================================
+\section{Implementation}
+\label{sec:impl}
+% =====================================================================
+
+\subsection{Reference Implementation}
+
+The reference implementation is in C++17, structured as:
+\begin{itemize}
+    \item \texttt{collatz\_perm.h}: header-only permutation with
+          architecture-specific paths.
+    \item \texttt{collatz\_crypto.h}: public API for Hash, AEAD, MAC.
+    \item \texttt{collatz\_crypto.cpp}: implementation, tests, and
+          benchmarks.
+\end{itemize}
+
+\subsection{ARM64 Optimization}
+
+On AArch64 (Apple Silicon), the \texttt{collatz\_mul\_pair} function is
+implemented as 11 inline assembly instructions:
+
+{\small
+\begin{verbatim}
+    eor  a, a, a, ror #41     // pre-mix: a ^= rotl(a, 23)
+    orr  a, a, #1             // ensure odd
+    add  t1, a, a, lsl #1     // t1 = 3*a
+    add  t1, t1, #1           // t1 = 3*a + 1
+    rbit t2, t1               // bit-reverse for ctz
+    clz  t2, t2               // ctz = clz(rbit(x))
+    lsr  a, t1, t2            // a = (3a+1) >> ctz
+    mul  t1, a, b             // lo = a * b
+    umulh t2, a, b            // hi = a * b
+    eor  a, a, t1             // a ^= lo
+    eor  b, b, t2             // b ^= hi
+\end{verbatim}
+}
+
+The function uses only general-purpose registers and has no
+data-dependent branches or memory accesses, making it constant-time with
+respect to the state values.
+
+\textbf{Note on \texttt{RBIT+CLZ}.} ARM64 does not have a native
+count-trailing-zeros instruction. Instead, we compose bit-reverse
+(\texttt{RBIT}) with count-leading-zeros (\texttt{CLZ}) to obtain
+$\ctz$ in 2 cycles. On x86-64, the \texttt{TZCNT} instruction
+provides this directly.
+
+\subsection{Constant-Time Guarantees}
+
+\begin{itemize}
+    \item The Collatz step uses \texttt{ORR} (bitwise OR with 1) instead
+          of a conditional branch.
+    \item Tag verification uses byte-wise OR accumulation, not early
+          return.
+    \item No secret-dependent array indexing or memory access patterns.
+\end{itemize}
+
+\textbf{Caveat:} The variable-length right shift $t \gg \ctz(t)$
+depends on the data-dependent shift amount $\ctz(t)$. On most modern
+processors (ARM64, x86-64), barrel shifters execute variable shifts in
+constant time. However, this should be verified on the target platform.
+
+% =====================================================================
+\section{Empirical Security Evaluation}
+\label{sec:security}
+% =====================================================================
+
+We run 70 automated tests covering permutation diffusion, hash
+avalanche, bit distribution, collision resistance, AEAD correctness and
+integrity, and MAC correctness.
+
+\subsection{Permutation Diffusion}
+\label{sec:diffusion}
+
+We verify that flipping any single bit in any of the 8 state words,
+after 12 rounds of CollatzPerm-512, changes all 8 output words. We test
+all 8 words at bit positions 0, 16, 32, and 48 (32 tests total).
+
+\textbf{Result:} 32/32 tests pass (all 8 words change in every case).
+This was achieved after adding the pre-mix rotation
+$a \leftarrow a \oplus \rotl(a, 23)$ to prevent the $a \,|\, 1$
+operation from absorbing bit 0.
+
+\subsection{Avalanche Effect}
+
+For each input string, we flip every bit of the input and measure the
+Hamming distance between the original and modified hash digests,
+expressed as a percentage of the output width:
+
+\begin{center}
+\begin{tabular}{|l|r|r|r|}
+\toprule
+\textbf{Input} & \textbf{256-bit} & \textbf{512-bit} & \textbf{1024-bit} \\
+\midrule
+\texttt{"hello world"}    & 50.3\% & 49.9\% & 50.0\% \\
+\texttt{"sample input 12"} & 49.8\% & 50.1\% & 50.1\% \\
+\texttt{"test input here"} & 49.6\% & 49.8\% & 49.9\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All values fall within the acceptable range of $50 \pm 5\%$, indicating
+near-ideal avalanche behavior across all output widths. The ideal value
+is 50\%, meaning each output bit flips with probability $\frac{1}{2}$
+when any input bit changes.
+
+\subsection{Bit Distribution}
+
+For 50,000 sequential inputs (\texttt{"dist\_0"} through
+\texttt{"dist\_49999"}), we measure the percentage of times each bit
+position is set to 1:
+
+\begin{center}
+\begin{tabular}{|l|r|r|}
+\toprule
+\textbf{Output Width} & \textbf{Min} & \textbf{Max} \\
+\midrule
+256-bit  & 49.5\% & 50.6\% \\
+1024-bit & 49.2\% & 50.6\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All bit positions are within $50 \pm 1\%$, indicating excellent
+uniformity.
+
+\subsection{Collision Resistance}
+
+We hash $10^6$ distinct inputs at both 256-bit and 1024-bit output
+widths and check for duplicate digests:
+
+\begin{center}
+\begin{tabular}{|l|r|r|}
+\toprule
+\textbf{Output Width} & \textbf{Inputs} & \textbf{Collisions} \\
+\midrule
+256-bit  & 1,000,000 & 0 \\
+1024-bit & 1,000,000 & 0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Note:} A birthday-bound collision search for a 256-bit hash
+requires approximately $2^{128}$ inputs; our test of
+$10^6 \approx 2^{20}$ inputs is insufficient to find collisions by
+chance and serves only to verify the absence of trivial implementation
+errors.
+
+\subsection{AEAD Integrity}
+
+We test authentication integrity by verifying that decryption fails
+(returns $\bot$) when any of the following are modified:
+
+\begin{center}
+\begin{tabular}{|l|r|}
+\toprule
+\textbf{Modification} & \textbf{Result} \\
+\midrule
+Flip 1 ciphertext bit & Rejected \\
+Flip 1 tag bit         & Rejected \\
+Flip 1 AAD bit         & Rejected \\
+Wrong key (1-bit diff) & Rejected \\
+Wrong nonce (1-bit diff) & Rejected \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All 5 authentication tests pass. AEAD roundtrip correctness is verified
+for plaintext lengths 0, 1, 15, 16, 31, 32, 33, 63, 64, 100, and 1000
+bytes (all 11 tests pass).
+
+\subsection{Key Sensitivity}
+
+Two 256-bit keys differing by a single bit produce ciphertexts with 93\%
+of bytes differing and completely different authentication tags.
+
+% =====================================================================
+\section{Performance}
+\label{sec:perf}
+% =====================================================================
+
+All benchmarks were run on Apple M3 Max (ARM64, 10 performance cores)
+with \texttt{g++ -O3 -march=native}. All comparison implementations are
+standalone C++ (no hardware acceleration extensions, no external
+libraries).
+
+\subsection{Hash Performance}
+
+\begin{center}
+\begin{tabular}{|l|l|r|r|}
+\toprule
+\textbf{Input} & \textbf{Algorithm} & \textbf{ops/sec} & \textbf{ns/op} \\
+\midrule
+5 B  & CollatzHash-256  & 17,066,218 & 58.6 \\
+     & CollatzHash-1024 & 5,963,157  & 167.7 \\
+     & SHA-256          & 4,828,820  & 207.1 \\
+\midrule
+12 B & CollatzHash-256  & 16,745,487 & 59.7 \\
+     & CollatzHash-1024 & 5,956,764  & 167.9 \\
+     & SHA-256          & 4,962,137  & 201.5 \\
+\midrule
+43 B & CollatzHash-256  & 10,903,183 & 91.7 \\
+     & CollatzHash-1024 & 4,944,270  & 202.3 \\
+     & SHA-256          & 4,911,992  & 203.6 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+CollatzHash-256 is \textbf{3.4$\times$ faster} than SHA-256 on short
+inputs. The advantage narrows for longer inputs as the sponge
+absorption cost grows proportionally.
+
+\subsection{AEAD Performance}
+
+\begin{center}
+\begin{tabular}{|r|r|r|l|}
+\toprule
+\textbf{Size} & \textbf{CollatzAEAD} & \textbf{ChaCha20} & \textbf{Ratio} \\
+\midrule
+64 B   & 332 MB/s   & 917 MB/s  & 0.36$\times$ \\
+256 B  & 629 MB/s   & 951 MB/s  & 0.66$\times$ \\
+1024 B & 800 MB/s   & 931 MB/s  & 0.86$\times$ \\
+4096 B & 859 MB/s   & 942 MB/s  & 0.91$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Note:} ChaCha20 here is encryption-only (no Poly1305
+authentication). CollatzAEAD provides combined encrypt+authenticate in a
+single pass, so the true comparison against ChaCha20-Poly1305 would be
+more favorable.
+
+\subsection{MAC Performance}
+
+\begin{center}
+\begin{tabular}{|l|r|r|}
+\toprule
+\textbf{Algorithm} & \textbf{ops/sec} & \textbf{ns/op} \\
+\midrule
+CollatzMAC-128 & 6,941,647  & 144.1 \\
+HMAC-SHA-256   & 1,290,474  & 774.9 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+CollatzMAC is \textbf{5.4$\times$ faster} than HMAC-SHA-256.
+
+% =====================================================================
+\section{Comparison with Existing Primitives}
+\label{sec:comparison}
+% =====================================================================
+
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\toprule
+\textbf{Property} & \textbf{SHA-256} & \textbf{SHA-3-256} & \textbf{Ascon} & \textbf{Collatz} \\
+\midrule
+State width        & 256 b   & 1600 b  & 320 b  & 512 b \\
+Capacity           & ---     & 512 b   & 192 b  & 256 b \\
+Security target    & 128 b   & 128 b   & 128 b  & 128 b \\
+Nonlinearity       & Ch, Maj & $\chi$  & S-box  & Collatz+mul \\
+Rounds/block       & 64      & 24      & 8      & 8 \\
+Output widths      & 256     & XOF     & ---    & 256/512/1024 \\
+AEAD mode          & No      & No      & Yes    & Yes \\
+MAC mode           & HMAC    & KMAC    & Yes    & Yes \\
+Standardized       & NIST    & NIST    & NIST   & No \\
+Peer review        & 20+ yr  & 15+ yr  & 10+ yr & This paper \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{Analysis of the Collatz Nonlinearity}
+\label{sec:analysis}
+% =====================================================================
+
+\subsection{Why the Collatz Step Provides Nonlinearity}
+
+Traditional symmetric ciphers derive nonlinearity from S-boxes (lookup
+tables with high differential and linear branch numbers) or from
+algebraic operations like modular multiplication. The Collatz step
+$f(a) = (3a+1) \gg \ctz(3a+1)$ provides nonlinearity through:
+
+\begin{enumerate}
+    \item \textbf{Data-dependent shift.} The shift amount
+          $\ctz(3a+1)$ varies unpredictably with $a$. This means the
+          output bits are a data-dependent permutation of the input bits
+          combined with the multiplication by 3, providing high algebraic
+          degree.
+    \item \textbf{Bit truncation.} The right shift discards
+          $\ctz(3a+1)$ low-order bits, making the function non-invertible
+          on the full 64-bit word. This loss of information is analogous
+          to the compression in S-box designs.
+    \item \textbf{Interaction with multiplication.} The subsequent
+          128-bit multiply amplifies the nonlinear bit patterns across
+          both output words.
+\end{enumerate}
+
+\subsection{Differential Properties}
+
+Let $\Delta_a$ denote an input difference in word $a$. After the
+Collatz step:
+$$f(a) = (3(a \,|\, 1) + 1) \gg \ctz(3(a \,|\, 1) + 1)$$
+
+The output difference $f(a \oplus \Delta_a) \oplus f(a)$ depends on
+both the algebraic carry propagation of the $3a+1$ operation and the
+data-dependent shift. A formal differential analysis would enumerate
+the probability $\Pr[\Delta_{\mathrm{out}} | \Delta_{\mathrm{in}}]$
+over all possible inputs, which we leave as future work.
+
+\subsection{The Pre-Mix Rotation}
+
+Without the pre-mix rotation $a \leftarrow a \oplus \rotl(a, 23)$,
+the $a \,|\, 1$ operation absorbs (destroys) bit 0 of the input. This
+creates a specific weakness: for any state word, toggling bit 0 has no
+effect after the Collatz step, violating the strict avalanche criterion.
+
+The pre-mix XORs bit 0 into bit 23, bit 1 into bit 24, etc., ensuring
+that every input bit---including bit 0---influences the Collatz step
+through a different bit position. The rotation distance 23 (equivalently,
+\texttt{ROR \#41} on ARM64) is chosen as:
+\begin{itemize}
+    \item Coprime to 64 (avoiding periodic alignment),
+    \item Not equal to any of the linear layer rotation constants
+          (19, 31, 7, 53).
+\end{itemize}
+
+% =====================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =====================================================================
+
+\subsection{Strengths}
+
+\begin{enumerate}
+    \item \textbf{Novel nonlinearity.} The Collatz step introduces a
+          number-theoretic nonlinear operation not found in any existing
+          cryptographic primitive. The chaotic behavior of the $3n+1$
+          mapping may provide resistance to algebraic attacks, though
+          this requires further analysis.
+    \item \textbf{Speed.} The Collatz--multiply hybrid achieves better
+          throughput than SHA-256 for hashing and is competitive with
+          ChaCha20 for encryption, without requiring hardware
+          acceleration.
+    \item \textbf{Simplicity.} One permutation serves all three modes.
+          The implementation is under 500 lines of C++ with no external
+          dependencies.
+    \item \textbf{Standard constructions.} The sponge and duplex modes
+          inherit formal security proofs from the literature, reducing
+          the analysis burden to the permutation itself.
+\end{enumerate}
+
+\subsection{Limitations and Open Questions}
+
+\begin{enumerate}
+    \item \textbf{No formal cryptanalysis.} The security of the
+          permutation rests on empirical evidence. Formal analysis of
+          differential, linear, and algebraic properties is needed.
+    \item \textbf{Algebraic structure.} The Collatz step is
+          algebraically simple ($3n+1$ followed by right-shift). An
+          attacker with knowledge of the algebraic structure might find
+          exploitable properties. The 128-bit multiply mitigates this but
+          does not eliminate the concern.
+    \item \textbf{Bit-0 absorption.} The $a \,|\, 1$ operation destroys
+          one bit of input per Collatz step. The pre-mix rotation
+          recovers this information, but the interaction between the
+          rotation and the multiply deserves further study.
+    \item \textbf{No hardware acceleration.} Unlike AES (AES-NI) and
+          SHA-256 (SHA extensions), there is no dedicated hardware
+          support for Collatz operations.
+    \item \textbf{Not standardized.} Adoption in production systems
+          requires peer review and potential standardization.
+    \item \textbf{Variable shift timing.} While barrel shifters on
+          modern processors execute in constant time regardless of shift
+          amount, some microcontrollers may not. Deployments on embedded
+          targets should verify constant-time behavior.
+\end{enumerate}
+
+\subsection{Recommended Use Cases}
+
+\begin{itemize}
+    \item File integrity checking and deduplication.
+    \item API authentication tokens and session management.
+    \item Encrypted storage and communication in applications where
+          SHA-256 is the performance bottleneck and hardware AES is
+          unavailable.
+    \item Research into number-theoretic cryptographic primitives.
+\end{itemize}
+
+\subsection{Not Recommended (Without Further Analysis)}
+
+\begin{itemize}
+    \item Digital signatures for high-value financial transactions.
+    \item Government or military classified communications.
+    \item Any application requiring FIPS~140 or Common Criteria
+          certification.
+\end{itemize}
+
+% =====================================================================
+\section{Future Work}
+\label{sec:future}
+% =====================================================================
+
+\begin{enumerate}
+    \item \textbf{Formal differential/linear cryptanalysis} of
+          CollatzPerm-512, including computation of the best differential
+          and linear characteristics.
+    \item \textbf{Algebraic attack resistance}: analyze the algebraic
+          degree of the round function and resistance to Gr\"obner basis
+          attacks.
+    \item \textbf{Bounds on round count}: determine the minimum number
+          of rounds for full diffusion and provable resistance to known
+          attacks.
+    \item \textbf{x86-64 SIMD optimization}: exploit AVX2/AVX-512 for
+          parallel Collatz-multiply pairs.
+    \item \textbf{Nonce-misuse resistance}: design an SIV-like mode
+          (Synthetic IV) that provides security even under nonce reuse.
+    \item \textbf{Test vectors}: publish a comprehensive set of
+          known-answer test vectors for interoperability.
+    \item \textbf{Side-channel analysis}: formal verification of
+          constant-time behavior on various microarchitectures.
+\end{enumerate}
+
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% =====================================================================
+
+We have presented a complete cryptographic suite built on the Collatz
+mapping: a 512-bit permutation, a sponge hash, a duplex-sponge AEAD
+cipher, and a keyed-sponge MAC. The suite targets 128-bit security,
+outperforms SHA-256 by 3.4$\times$ for hashing, matches ChaCha20 for
+large-message encryption, and surpasses HMAC-SHA-256 by 5.4$\times$ for
+message authentication.
+
+The design demonstrates that the chaotic behavior of the $3n+1$ mapping
+can serve as an effective nonlinear mixing primitive when combined with
+128-bit integer multiplication for diffusion. We invite the cryptographic
+community to analyze the permutation's resistance to differential,
+linear, and algebraic attacks.
+
+The reference implementation is available at:
+\texttt{https://github.com/zmockwebdesign/collatz-v2}
+
+% =====================================================================
+\section*{Acknowledgments}
+% =====================================================================
+
+The sponge and duplex constructions follow the frameworks established by
+Bertoni, Daemen, Peeters, and Van Assche for Keccak/SHA-3 and by
+Dobraunig, Eichlseder, Mendel, and Schl\"affer for Ascon.
+
+% =====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{lagarias1985}
+J.~C. Lagarias,
+``The $3x+1$ problem and its generalizations,''
+\textit{American Mathematical Monthly}, vol.~92, no.~1, pp.~3--23, 1985.
+
+\bibitem{keccak_sponge}
+G.~Bertoni, J.~Daemen, M.~Peeters, and G.~Van Assche,
+``Cryptographic sponge functions,''
+\texttt{https://keccak.team/files/CSF-0.1.pdf}, 2011.
+
+\bibitem{sha3}
+NIST,
+``SHA-3 Standard: Permutation-Based Hash and Extendable-Output
+Functions,'' FIPS~202, 2015.
+
+\bibitem{ascon}
+C.~Dobraunig, M.~Eichlseder, F.~Mendel, and M.~Schl\"affer,
+``Ascon v1.2: Lightweight Authenticated Encryption and Hashing,''
+\textit{Journal of Cryptology}, vol.~34, 2021.
+NIST Lightweight Cryptography Standard, 2023.
+
+\bibitem{sponge_security}
+G.~Bertoni, J.~Daemen, M.~Peeters, and G.~Van Assche,
+``On the security of the keyed sponge construction,''
+\textit{SKEW 2011}, 2011.
+
+\bibitem{duplex}
+G.~Bertoni, J.~Daemen, M.~Peeters, and G.~Van Assche,
+``Duplexing the sponge: Single-pass authenticated encryption and other
+applications,'' \textit{SAC 2011}, LNCS~7118, pp.~320--337, 2012.
+
+\bibitem{rapidhash}
+N.~Kurz,
+``rapidhash --- Very fast, high quality, platform-independent hashing
+algorithm,'' \texttt{https://github.com/Nicoshev/rapidhash}, 2024.
+
+\bibitem{wyhash}
+Y.~Wang,
+``wyhash --- The fastest hash function,''
+\texttt{https://github.com/wangyi-fudan/wyhash}, 2023.
+
+\bibitem{xxhash}
+Y.~Collet,
+``xxHash --- Extremely fast non-cryptographic hash algorithm,''
+\texttt{https://github.com/Cyan4973/xxHash}, 2024.
+
+\end{thebibliography}
+
+% =====================================================================
+\appendix
+\section{Test Vectors}
+\label{app:testvectors}
+
+The following test vectors are produced by the reference implementation.
+
+\subsection{CollatzHash-256}
+
+\begin{verbatim}
+Input:  "" (empty)
+Output: f266161215a29b9f62dd4b71b4b05144
+        40841de8358cd66db10fe489202ccf58
+
+Input:  "abc"
+Output: a170ec42f3e1513522b7513f478272db
+        054729f09bcd9e4d30f6a661c7a8e0cd
+
+Input:  "hello world"
+Output: 4bec83a5598cecee53dc89697f51e928
+        e93783237399d7b03415bb6c0ed08c9c
+\end{verbatim}
+
+\subsection{CollatzHash-512}
+
+\begin{verbatim}
+Input:  "" (empty)
+Output: f266161215a29b9f62dd4b71b4b05144
+        40841de8358cd66db10fe489202ccf58
+        1a14744ac45936e49b4e751374281ed7
+        72b5b1e6be4811fe31015171e22c5812
+
+Input:  "abc"
+Output: a170ec42f3e1513522b7513f478272db
+        054729f09bcd9e4d30f6a661c7a8e0cd
+        13d531694946463d91e759c1acc0d320
+        ad5c3995e8a9b32a1b5351dfd95ffe79
+
+Input:  "hello world"
+Output: 4bec83a5598cecee53dc89697f51e928
+        e93783237399d7b03415bb6c0ed08c9c
+        36d90399456178f7a3a6082e9620af31
+        e11bd7c81b179784fd351a9ba58fa378
+\end{verbatim}
+
+\subsection{CollatzMAC-128}
+
+\begin{verbatim}
+Key:    00000000000000000000000000000000
+        00000000000000000000000000000000
+
+Input:  "" (empty)
+Output: daff09bb11ac65519bfbe22483fed036
+
+Input:  "abc"
+Output: 951eebfd00e05e79c5d182e11b2a3286
+\end{verbatim}
+
+\end{document}

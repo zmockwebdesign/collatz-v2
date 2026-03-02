@@ -24,7 +24,7 @@ def main():
     print("              Uses only: arithmetic, bit ops, Collatz algorithm")
     print()
     
-    test_text = "Noobas123!@#"
+    test_text = "sample input 12"
     
     # Generate sample hashes
     print("-" * 80)

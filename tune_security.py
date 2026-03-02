@@ -41,7 +41,7 @@ def analyze(text, multiplier, num_levels):
 
 
 def main():
-    text = 'Noobas123!@#'
+    text = 'sample input 12'
     
     print("=" * 80)
     print(f"TUNING COLLATZ SECURITY FOR: '{text}'")

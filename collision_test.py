@@ -29,9 +29,9 @@ test_inputs = [
     'passw0rd',
     'passwrod',  # typo
     'drowssap',  # reversed
-    'Noobas123!@#',
-    'Noobas123!@$',
-    'noobas123!@#',
+    'password123!@#',
+    'password123!@$',
+    'Password123!@#',
     'hi',
     'Hi',
     'hj',  # adjacent char

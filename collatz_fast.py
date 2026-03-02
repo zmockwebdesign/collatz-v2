@@ -161,7 +161,7 @@ def benchmark():
     from collatz_seeded import deterministic_seed, text_to_number_512
     from collatz_analysis import collatz_sequence, find_downstep_sequences
     
-    test_inputs = ['hi', 'password', 'Noobas123!@#', 'MySecretKey123']
+    test_inputs = ['hi', 'password', 'sample input 12', 'MySecretKey123']
     iterations = 200
     
     print("=" * 80)
